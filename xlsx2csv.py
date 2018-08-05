@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 #
 #   Copyright information
 #
@@ -21,7 +21,7 @@
 
 __author__ = "Dilshod Temirkhodjaev <tdilshod@gmail.com>"
 __license__ = "GPL-2+"
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 
 import csv, datetime, zipfile, string, sys, os, re, signal
 import xml.parsers.expat
@@ -136,6 +136,7 @@ class Xlsx2csv:
      options:
        sheetid - sheet no to convert (0 for all sheets)
        dateformat - override date/time format
+       floatformat - override float format
        delimiter - csv columns delimiter symbol
        sheetdelimiter - sheets delimiter used when processing all sheets
        skip_empty_lines - skip empty lines
@@ -149,6 +150,7 @@ class Xlsx2csv:
         options.setdefault("delimiter", ",")
         options.setdefault("sheetdelimiter", "--------")
         options.setdefault("dateformat", None)
+        options.setdefault("floatformat", None)
         options.setdefault("skip_empty_lines", False)
         options.setdefault("skip_trailing_columns", False)
         options.setdefault("escape_strings", False)
@@ -157,7 +159,7 @@ class Xlsx2csv:
         options.setdefault("exclude_sheet_pattern", [])
         options.setdefault("merge_cells", False)
         options.setdefault("ignore_formats", [''])
-
+        options.setdefault("lineterminator", "\n")
 
         self.options = options
         try:
@@ -173,6 +175,10 @@ class Xlsx2csv:
         self.workbook.relationships = self._parse(Relationships, "xl/_rels/workbook.xml.rels")
         if self.options['escape_strings']:
             self.shared_strings.escape_strings()
+
+    def __del__(self):
+        # make sure to close zip file, ziphandler does have a close() method
+        self.ziphandle.close()
 
     def getSheetIdByName(self, name):
         for s in self.workbook.sheets:
@@ -241,14 +247,19 @@ class Xlsx2csv:
         try:
             writer = csv.writer(outfile, quoting=csv.QUOTE_MINIMAL, delimiter=self.options['delimiter'], lineterminator=self.options['lineterminator'])
             sheetfile = self._filehandle("xl/worksheets/sheet%i.xml" % sheetid)
+            if not sheetfile:
+                sheetfile = self._filehandle("xl/worksheets/worksheet%i.xml" % sheetid)
             if not sheetfile and sheetid == 1:
                 sheetfile = self._filehandle("xl/worksheets/sheet.xml")
+            if not sheetfile and sheetid == 1:
+                sheetfile = self._filehandle("xl/worksheets/worksheet.xml")
             if not sheetfile:
                 raise SheetNotFoundException("Sheet %s not found" %sheetid)
+            sheet = Sheet(self.workbook, self.shared_strings, self.styles, sheetfile)
             try:
-                sheet = Sheet(self.workbook, self.shared_strings, self.styles, sheetfile)
                 sheet.relationships = self._parse(Relationships, "xl/worksheets/_rels/sheet%i.xml.rels" % sheetid)
                 sheet.set_dateformat(self.options['dateformat'])
+                sheet.set_floatformat(self.options['floatformat'])
                 sheet.set_skip_empty_lines(self.options['skip_empty_lines'])
                 sheet.set_skip_trailing_columns(self.options['skip_trailing_columns'])
                 sheet.set_include_hyperlinks(self.options['hyperlinks'])
@@ -259,6 +270,7 @@ class Xlsx2csv:
                 sheet.to_csv(writer)
             finally:
                 sheetfile.close()
+                sheet.close()
         finally:
             if closefile:
                 outfile.close()
@@ -467,6 +479,7 @@ class Sheet:
         self.max_columns = -1
 
         self.dateformat = None
+        self.floatformat = None
         self.skip_empty_lines = False
         self.skip_trailing_columns = False
 
@@ -480,8 +493,15 @@ class Sheet:
         self.mergeCells = {}
         self.ignore_formats = []
 
+    def close(self):
+        # Make sure Worksheet is closed, parsers lib does not have a close() function, so simply delete it
+        self.parser = None
+
     def set_dateformat(self, dateformat):
         self.dateformat = dateformat
+
+    def set_floatformat(self, floatformat):
+        self.floatformat = floatformat
 
     def set_skip_empty_lines(self, skip):
         self.skip_empty_lines = skip
@@ -621,6 +641,8 @@ class Sheet:
                         format_type = "date"
                 elif re.match("^-?\d+(.\d+)?$", self.data):
                     format_type = "float"
+                if format_type == 'date' and self.dateformat == 'float' :
+                    format_type = "float"
                 if format_type and not format_type in self.ignore_formats :
                     try:
                         if format_type == 'date': # date/time
@@ -648,10 +670,13 @@ class Sheet:
                         elif format_type == 'float' and ('E' in self.data or 'e' in self.data):
                             self.data = ("%f" %(float(self.data))).rstrip('0').rstrip('.')
                         elif format_type == 'float' and format_str[0:3] == '0.0':
-                            L = len(format_str.split(".")[1])
-                            if '%' in format_str:
-                                L += 1
-                            self.data = ("%." + str(L) + "f") % float(self.data)
+                            if self.floatformat:
+                                self.data = str(self.floatformat) % float(self.data)
+                            else:
+                                L = len(format_str.split(".")[1])
+                                if '%' in format_str:
+                                    L += 1
+                                self.data = ("%." + str(L) + "f") % float(self.data)
 
                     except (ValueError, OverflowError):
                         # invalid date format
@@ -839,6 +864,8 @@ if __name__ == "__main__":
       help="exclude sheets named matching given pattern, only effects when -a option is enabled.")
     parser.add_argument("-f", "--dateformat", dest="dateformat",
       help="override date/time format (ex. %%Y/%%m/%%d)")
+    parser.add_argument("--floatformat", dest="floatformat",
+      help="override float format (ex. %%.15f")
     parser.add_argument("-I", "--include_sheet_pattern", nargs=nargs_plus, dest="include_sheet_pattern", default="^.*$",
       help="only include sheets named matching given pattern, only effects when -a option is enabled.")
     parser.add_argument("-if", "--ignore-formats", nargs=nargs_plus, type=str, dest="ignore_formats", default=[''],
@@ -907,6 +934,7 @@ if __name__ == "__main__":
       'delimiter' : options.delimiter,
       'sheetdelimiter' : options.sheetdelimiter,
       'dateformat' : options.dateformat,
+      'floatformat' : options.floatformat,
       'skip_empty_lines' : options.skip_empty_lines,
       'skip_trailing_columns' : options.skip_trailing_columns,
       'escape_strings' : options.escape_strings,
